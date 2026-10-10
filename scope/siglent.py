@@ -42,6 +42,7 @@ class SiglentScope:
         self._sock = None
         self._buf = b""
         self._lock = threading.RLock()
+        self._run_mode = "AUTO"  # trigger mode run() resumes to; updated whenever we see the scope running
 
     # --- connection ---------------------------------------------------------
 
@@ -91,21 +92,26 @@ class SiglentScope:
         except OSError as e:
             self._fail(f"Send failed for {cmd!r}: {e}", e)
 
-    def _recv_more(self, cmd):
+    def _recv_more(self, cmd, tolerate_silence=False):
         try:
             chunk = self._sock.recv(1 << 16)
+        except socket.timeout as e:
+            if tolerate_silence and not self._buf:
+                # Unrecognised queries get no reply at all; nothing arrived, so the stream is still in sync.
+                raise ScopeError(f"No response to {cmd!r} (unknown command?)") from e
+            self._fail(f"No response to {cmd!r}: {e}", e)
         except OSError as e:
             self._fail(f"No response to {cmd!r}: {e}", e)
         if not chunk:
             self._fail(f"Scope closed the connection during {cmd!r}")
         self._buf += chunk
 
-    def _query(self, cmd):
+    def _query(self, cmd, tolerate_silence=False):
         """Send a query and return its response line, skipping stray blank lines left by block transfers."""
         self._write(cmd)
         while True:
             while b"\n" not in self._buf:
-                self._recv_more(cmd)
+                self._recv_more(cmd, tolerate_silence)
             line, self._buf = self._buf.split(b"\n", 1)
             line = line.strip()
             if line:
@@ -143,9 +149,34 @@ class SiglentScope:
     # --- public API ---------------------------------------------------------
 
     def query(self, cmd):
-        """Send an arbitrary query and return the response string."""
+        """Send an arbitrary text query and return the response string.
+
+        An unknown query raises ScopeError after the timeout but keeps the connection open.
+        """
         with self._lock:
-            return self._query(cmd)
+            return self._query(cmd, tolerate_silence=True)
+
+    def _trigger_mode(self):
+        mode = self._query("TRMD?").split()[-1]
+        if mode != "STOP":
+            self._run_mode = mode
+        return mode
+
+    def trigger_mode(self):
+        """Current trigger mode: AUTO, NORM, SINGLE or STOP."""
+        with self._lock:
+            return self._trigger_mode()
+
+    def run(self):
+        """Resume acquisition in the last running trigger mode seen (AUTO if none). Returns the new mode."""
+        with self._lock:
+            self._write(f"TRMD {self._run_mode}")
+            return self._trigger_mode()
+
+    def stop(self):
+        with self._lock:
+            self._write("STOP")
+            return self._trigger_mode()
 
     def enabled_channels(self):
         with self._lock:
@@ -164,7 +195,7 @@ class SiglentScope:
             if disabled:
                 raise ScopeError(f"Channel(s) {', '.join(disabled)} are turned off on the scope")
 
-            previous_mode = self._query("TRMD?").split()[-1]
+            previous_mode = self._trigger_mode()
             stopped = freeze and previous_mode != "STOP"
             if stopped:
                 self._write("STOP")

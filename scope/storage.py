@@ -5,13 +5,18 @@ CSV: '#' comment lines with metadata, then columns time_s,C2_V,C3_V,...
 NPZ: arrays 'time' and one per channel ('C2', ...), plus 'metadata' as a JSON string.
 
 Both load back with load_traces(path) -> {"time": array, "C2": array, ..., "metadata": dict}.
+
+The NPZ layout doubles as the wire format for the local API (traces_to_npz_bytes / traces_from_npz_bytes).
 """
 
+import io
 import json
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+
+from scope.trace import Trace
 
 SHARED_KEYS = ("instrument", "captured_at", "trigger_mode", "tdiv", "trigger_delay", "sample_rate", "n_points")
 CHANNEL_KEYS = ("vdiv", "offset")
@@ -53,10 +58,38 @@ def save_csv(traces, path):
         np.savetxt(f, data, delimiter=",", fmt=fmt)
 
 
-def save_npz(traces, path):
+def save_npz(traces, file, compress=True):
+    """Write traces as NPZ to a path or binary file object."""
     arrays = {"time": _shared_time(traces)}
     arrays.update({ch: t.voltage for ch, t in traces.items()})
-    np.savez_compressed(path, metadata=json.dumps(_metadata(traces)), **arrays)
+    writer = np.savez_compressed if compress else np.savez
+    writer(file, metadata=json.dumps(_metadata(traces)), **arrays)
+
+
+def traces_to_npz_bytes(traces):
+    buf = io.BytesIO()
+    save_npz(traces, buf, compress=False)  # local transfer: speed matters more than size
+    return buf.getvalue()
+
+
+def traces_from_npz_bytes(data):
+    """Inverse of traces_to_npz_bytes: rebuild {channel: Trace} with the original metadata."""
+    with np.load(io.BytesIO(data)) as z:
+        meta = json.loads(str(z["metadata"]))
+        per_channel = meta.pop("channels")
+        time = z["time"]
+        return {
+            ch: Trace(ch, time, z[ch], {**meta, **ch_meta, "channel": ch})
+            for ch, ch_meta in per_channel.items()
+        }
+
+
+def traces_to_json(traces):
+    """Plain-JSON form for non-Python clients: {"time": [...], "C2": [...], "metadata": {...}}."""
+    out = {"time": _shared_time(traces).tolist()}
+    out.update({ch: t.voltage.tolist() for ch, t in traces.items()})
+    out["metadata"] = _metadata(traces)
+    return out
 
 
 def save_traces(traces, path):
