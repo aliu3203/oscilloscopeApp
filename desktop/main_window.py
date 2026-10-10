@@ -1,7 +1,10 @@
+from pathlib import Path
+
 import pyqtgraph as pg
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import QSettings, QThreadPool
 from PySide6.QtWidgets import (
     QCheckBox,
+    QFileDialog,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -14,8 +17,10 @@ from PySide6.QtWidgets import (
 
 from desktop.worker import Worker
 from scope.siglent import CHANNELS, SiglentScope
+from scope.storage import default_filename, save_traces
 
 DEFAULT_IP = "10.0.0.237"
+SAVE_FILTERS = {"CSV (*.csv)": ".csv", "NumPy archive (*.npz)": ".npz"}
 
 # Roughly the scope's own channel colors, darkened to be readable on a white background.
 CHANNEL_COLORS = {"C1": "#b8960b", "C2": "#d6249f", "C3": "#008b9a", "C4": "#1f4fd1"}
@@ -30,6 +35,7 @@ class MainWindow(QMainWindow):
         self.scope = None
         self.traces = {}
         self._worker = None  # keep a reference so its signals outlive the pool's run()
+        self.settings = QSettings("researchMusumeci", "OscilloscopeCapture")
 
         # Connection row
         self.ip_edit = QLineEdit(DEFAULT_IP)
@@ -88,6 +94,7 @@ class MainWindow(QMainWindow):
 
         self.connect_btn.clicked.connect(self.on_connect_clicked)
         self.capture_btn.clicked.connect(self.on_capture_clicked)
+        self.save_btn.clicked.connect(self.on_save_clicked)
 
     # --- helpers ------------------------------------------------------------
 
@@ -102,6 +109,7 @@ class MainWindow(QMainWindow):
         self.connect_btn.setEnabled(not busy)
         self.ip_edit.setEnabled(not busy and not connected)
         self.capture_btn.setEnabled(not busy and connected)
+        self.save_btn.setEnabled(not busy and bool(self.traces))
 
     def _set_disconnected(self, message):
         if self.scope is not None:
@@ -167,6 +175,33 @@ class MainWindow(QMainWindow):
         else:
             self._set_busy(False)
             self.statusBar().showMessage(message)
+
+    # --- save ---------------------------------------------------------------
+
+    def on_save_clicked(self):
+        last_dir = self.settings.value("last_save_dir", str(Path.home()))
+        suggested = str(Path(last_dir) / default_filename(self.traces))
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "Save traces", suggested, ";;".join(SAVE_FILTERS)
+        )
+        if not path:
+            return
+        path = Path(path)
+        if path.suffix.lower() not in SAVE_FILTERS.values():
+            path = path.with_name(path.name + SAVE_FILTERS.get(selected_filter, ".csv"))
+
+        self.settings.setValue("last_save_dir", str(path.parent))
+        self._set_busy(True)
+        self.statusBar().showMessage(f"Saving {path.name}…")
+        self._run(save_traces, self.on_saved, self.on_save_failed, self.traces, path)
+
+    def on_saved(self, path):
+        self._set_busy(False)
+        self.statusBar().showMessage(f"Saved {path}")
+
+    def on_save_failed(self, message):
+        self._set_busy(False)
+        self.statusBar().showMessage(f"Save failed: {message}")
 
     def closeEvent(self, event):
         if self.scope is not None:

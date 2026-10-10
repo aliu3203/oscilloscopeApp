@@ -39,3 +39,15 @@ traces = scope.get_traces(["C2", "C4"])   # {"C2": Trace, "C4": Trace}
 traces["C2"].time, traces["C2"].voltage, traces["C2"].metadata
 scope.close()
 ```
+
+## Saving
+
+**Save…** writes the last capture to a path you choose: `.csv` (metadata in `#` header lines, then
+`time_s,C1_V,...` columns) or `.npz` (compressed NumPy arrays + JSON metadata). The suggested filename
+comes from `scope.storage.default_filename` — change the naming scheme there.
+
+```python
+from scope.storage import load_traces
+d = load_traces("scope_20261009_193215.csv")   # or .npz
+d["time"], d["C2"], d["metadata"]
+```

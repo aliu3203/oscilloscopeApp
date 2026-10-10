@@ -22,7 +22,8 @@ class Trace:
 def codes_to_trace(raw, channel, vdiv, offset, tdiv, trdl, sample_rate, extra_metadata=None):
     """Convert raw signed 8-bit waveform codes into time (s) and voltage (V) arrays."""
     codes = np.frombuffer(raw, dtype=np.int8).astype(np.float64)
-    voltage = codes * (vdiv / CODES_PER_DIV) - offset
+    # Round to 1 nV to drop float noise like 4.4e-16; the ADC step is >= 20 uV.
+    voltage = np.round(codes * (vdiv / CODES_PER_DIV) - offset, 9)
     t0 = -(H_DIVS / 2) * tdiv - trdl
     time = t0 + np.arange(len(codes)) / sample_rate
 
