@@ -6,8 +6,14 @@ magnet's step (its kick) on both photodiodes, measured with the step times locke
 center, so kick vs. position is a straight line, and where it crosses zero is the position that puts
 that magnet's center on the wire along this axis.
 
-Positions are in whatever unit the stage reads (µm, mm, ticks, turns); only differences matter.
-Kicks are in mV.
+Scanning x zeroes the kick along x with y wherever it is. The diodes' axes, the magnet's roll and the
+stage's axes are not lined up, so that zero leaves a y error, and the y scan then leaves a smaller x
+error. Each x-then-y round multiplies the error by rho = (J_xy J_yx) / (J_xx J_yy), where J is the
+2x2 response (rows: the diode used for x, the diode used for y; columns: stage x, y). That needs the
+right diode on each axis: the swapped pairing has rho -> 1/rho and diverges. One x scan plus one y
+scan give all four slopes, so center_2d solves for the magnetic center directly instead.
+
+Positions are the stage readings, in whatever unit the stage reads (µm, mm, ticks, turns). Kicks are in mV.
 """
 
 from dataclasses import dataclass, field
@@ -39,6 +45,9 @@ class LineFit:
     x0_err: float
     chi2: float  # chi-square per degree of freedom; nan with only two positions
     n: int
+    xm: float  # weighted mean position of the points
+    level: float  # the line's value at xm, mV (uncorrelated with the slope)
+    level_err: float
 
     @property
     def significant(self):
@@ -64,11 +73,13 @@ def fit_line(x, y, err):
     dof = len(x) - 2
     chi2 = float(np.sum(w * (y - a - b * u) ** 2) / dof) if dof > 0 else float("nan")
     scale = max(1.0, chi2) if dof > 0 else 1.0
+    a_err, b_err = float(np.sqrt(scale * var_a)), float(np.sqrt(scale * var_b))
     if b == 0:
-        return LineFit(0.0, float(np.sqrt(scale * var_b)), float("nan"), float("nan"), chi2, len(x))
-    x0 = xm - a / b
-    x0_err = np.sqrt(scale * (var_a / b**2 + a**2 * var_b / b**4))
-    return LineFit(float(b), float(np.sqrt(scale * var_b)), float(x0), float(x0_err), chi2, len(x))
+        x0, x0_err = float("nan"), float("nan")
+    else:
+        x0 = float(xm - a / b)
+        x0_err = float(np.sqrt(scale * (var_a / b**2 + a**2 * var_b / b**4)))
+    return LineFit(float(b), b_err, x0, x0_err, chi2, len(x), float(xm), float(a), a_err)
 
 
 @dataclass
@@ -81,35 +92,32 @@ class ScanPoint:
 class ScanResult:
     fits: dict  # magnet -> {role: LineFit}
     target: str  # the magnet this stage centers
-    role: str  # the diode used for the answer: the one that pins the zero crossing best
+    role: str  # the diode whose zero crossing is the answer (None if it has no clear slope)
     x0: float
     x0_err: float
     notes: list = field(default_factory=list)
 
 
-def _best_role(fits):
-    usable = {role: f for role, f in fits.items() if f.significant}
-    return min(usable, key=lambda role: usable[role].x0_err) if usable else None
+def fit_all(points, roles):
+    """{magnet: {role: LineFit}}: every magnet's kick against position, on every diode."""
+    x = [p.x for p in points]
+    return {magnet: {r: fit_line(x, [p.steps[magnet][0][k] for p in points], [p.steps[magnet][1][k] for p in points])
+                     for k, r in enumerate(roles)}
+            for magnet in points[0].steps}
 
 
-def analyze(points, roles, target):
-    """Line fit of every magnet's kick on every diode, and the target magnet's zero crossing."""
+def analyze(points, roles, target, role):
+    """Line fit of every magnet's kick on every diode, and the target's zero crossing on diode `role`."""
     x = np.array([p.x for p in points])
-    fits = {}
-    for magnet in points[0].steps:
-        fits[magnet] = {}
-        for k, role in enumerate(roles):
-            S = [p.steps[magnet][0][k] for p in points]
-            E = [p.steps[magnet][1][k] for p in points]
-            fits[magnet][role] = fit_line(x, S, E)
-
+    fits = fit_all(points, roles)
     notes = []
-    role = _best_role(fits[target])
-    if role is None:
-        return ScanResult(fits, target, None, float("nan"), float("nan"),
-                          [f"{target}'s kick shows no clear slope on either diode: widen the scan (bigger step), "
-                           "or check that the steps are still locked (look at the last capture)."])
     best = fits[target][role]
+    if not best.significant:
+        others = [r for r in roles if r != role and fits[target][r].significant]
+        notes.append(f"{target}'s kick on {role} shows no clear slope along this axis"
+                     + (f" ({others[0]} does: its zero is listed, but iterating with it may not converge)." if others
+                        else ": widen the scan (bigger step), or check that the steps are still locked (last capture)."))
+        return ScanResult(fits, target, None, float("nan"), float("nan"), notes)
 
     lo, hi = x.min(), x.max()
     past = max(best.x0 - hi, lo - best.x0)
@@ -119,10 +127,52 @@ def analyze(points, roles, target):
     if np.isfinite(best.chi2) and best.chi2 > SCATTER_CHI2:
         notes.append(f"The points scatter {np.sqrt(best.chi2):.1f}× more than their error bars: look for a bad "
                      "capture (Undo last) or a bent line (the scan is too wide; scan closer to the zero).")
-    other = [r for r in roles if r != role and fits[target][r].significant]
-    for r in other:
+    for r in roles:
         f = fits[target][r]
-        if abs(f.x0 - best.x0) > DISAGREE_SIGMA * np.hypot(f.x0_err, best.x0_err):
-            notes.append(f"{r} puts the zero at {f.x0:.4g} ± {f.x0_err:.2g}, away from {role}'s. The wire is "
-                         "probably off center along the other axis too: center that axis, then rescan this one.")
+        if r != role and f.significant and abs(f.x0 - best.x0) > DISAGREE_SIGMA * np.hypot(f.x0_err, best.x0_err):
+            notes.append(f"The diodes disagree on the zero: the wire is off center along the other axis too. "
+                         f"Center that axis, then rescan this one (or use the 2×2 center).")
     return ScanResult(fits, target, role, best.x0, best.x0_err, notes)
+
+
+@dataclass
+class Center:
+    """A magnet's center from one x scan and one y scan of the same stage."""
+
+    magnet: str
+    J: np.ndarray  # mV per unit; rows: diodes (roles order), columns: stage x, y
+    x: float  # stage reading that puts the center on the wire
+    y: float
+    x_err: float
+    y_err: float
+    rho: float  # per-round error factor of x-then-y scans with diode roles[0] on x and roles[1] on y
+    cond: float  # condition number of J: large means one diode barely tells the axes apart
+
+
+def center_2d(magnet, fits_x, fits_y, roles, samples=4000):
+    """Solve S = J (p - p*) for the center p*, from the x scan's and y scan's line fits of one magnet.
+
+    The x scan gives J's first column (slopes along x) and, at its mean position, both diodes' kicks:
+    J^-1 of those is the wire's offset from the center at that point, whose x part pins x* in stage
+    readings. The y scan does the same for y*. Neither needs the other axis's reading during the scan.
+    Uncertainties come from resampling every slope and level within its error.
+    """
+    fx, fy = [fits_x[r] for r in roles], [fits_y[r] for r in roles]
+
+    def solve(sx, sy, lx, ly):
+        J = np.stack([np.stack([sx[..., 0], sy[..., 0]], -1), np.stack([sx[..., 1], sy[..., 1]], -1)], -2)
+        Jinv = np.linalg.inv(J)
+        dx = np.einsum("...ij,...j->...i", Jinv, lx)  # offset (p - p*) at the x scan's mean position
+        dy = np.einsum("...ij,...j->...i", Jinv, ly)
+        return J, fx[0].xm - dx[..., 0], fy[0].xm - dy[..., 1]
+
+    val = lambda fits, attr: np.array([getattr(f, attr) for f in fits])  # noqa: E731
+    J, x, y = solve(val(fx, "slope"), val(fy, "slope"), val(fx, "level"), val(fy, "level"))
+    rng = np.random.default_rng(0)
+    draw = lambda fits, attr: val(fits, attr) + val(fits, attr + "_err") * rng.standard_normal((samples, len(fits)))  # noqa: E731
+    _, xs, ys = solve(draw(fx, "slope"), draw(fy, "slope"), draw(fx, "level"), draw(fy, "level"))
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    # Robust spread (the inverse has heavy tails when a slope's error is not small)
+    spread = lambda a: float(1.4826 * np.median(np.abs(a - np.median(a))))  # noqa: E731
+    rho = J[0, 1] * J[1, 0] / (J[0, 0] * J[1, 1])
+    return Center(magnet, J, float(x), float(y), spread(xs[ok]), spread(ys[ok]), float(rho), float(np.linalg.cond(J)))

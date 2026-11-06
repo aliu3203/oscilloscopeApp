@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSplitter,
     QVBoxLayout,
     QWidget,
@@ -36,7 +37,7 @@ from PySide6.QtWidgets import (
 from desktop.main_window import CHANNEL_COLORS
 from desktop.worker import Worker
 from scan_align.session import Session
-from scan_align.zero import ScanPoint, analyze, decimate
+from scan_align.zero import ScanPoint, analyze, center_2d, decimate, fit_all
 from scope.client import ScopeClient
 from scope.siglent import CHANNELS
 from translate_align.alignment import MAGNETS, step_vectors
@@ -49,6 +50,12 @@ DEFAULT_FIRST = "PMQ2"
 # Stage -> (name, magnet it centers). The cage moves both magnets, so it centers PMQ2; the mount moves PMQ1 only.
 STAGES = {"cage": ("Cage stage", "PMQ2"), "mount": ("PMQ1 mount", "PMQ1")}
 AXES = ("x", "y")
+# Which diode zeroes which axis. Iterating x-then-y converges only with the pairing whose rho is below 1
+# (the other pairing has 1/rho), so once both axes are scanned the app swaps this if the response says so.
+PAIRING = {"x": "Diode X", "y": "Diode Y"}
+# Magnets whose center a stage's 2x2 solve can find: the mount does not move PMQ2.
+CENTERS_2D = {"cage": ("PMQ2", "PMQ1"), "mount": ("PMQ1",)}
+LEAK_WARN = 0.05  # warn when PMQ2's kick moves with the mount by this fraction of PMQ1's
 UNITS = ("µm", "mm", "ticks", "turns")
 MAGNET_COLORS = {"PMQ1": (31, 119, 180), "PMQ2": (214, 39, 40)}
 
@@ -98,6 +105,8 @@ class ScanWindow(QMainWindow):
         self.channels = None  # role -> channel the models were located on
         self.scan = 1
         self.points = []  # (position, Shot) per Collect, in the order taken
+        self.latest = {}  # (stage, axis) -> {"scan", "unit", "points", "other"}: the latest scan of each axis, for the 2x2 solve
+        self.collected = {stage: 0 for stage in STAGES}  # points collected per stage, to tell when the other stage moved
         self.last_shot = None
         self._pending_x = None
 
@@ -188,15 +197,20 @@ class ScanWindow(QMainWindow):
         font = QFont(self.result_label.font())
         font.setPointSize(font.pointSize() + 2)
         self.result_label.setFont(font)
+        result_scroll = QScrollArea()
+        result_scroll.setWidgetResizable(True)
+        result_scroll.setFrameShape(QScrollArea.NoFrame)
+        result_scroll.setWidget(self.result_label)
+        self.result_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         result_layout = QVBoxLayout()
-        result_layout.addWidget(self.result_label)
+        result_layout.addWidget(result_scroll)
         result_group = QGroupBox("Zero crossing")
         result_group.setLayout(result_layout)
 
         left_panel = QVBoxLayout()
-        for group in (diodes_group, locate_group, scan_group, result_group):
+        for group in (diodes_group, locate_group, scan_group):
             left_panel.addWidget(group)
-        left_panel.addStretch()
+        left_panel.addWidget(result_group, stretch=1)  # takes the rest of the height; scrolls when longer
         left_widget = QWidget()
         left_widget.setLayout(left_panel)
         left_widget.setFixedWidth(340)
@@ -349,9 +363,9 @@ class ScanWindow(QMainWindow):
         for role, channel in channels.items():
             self.settings.setValue(f"channel/{role}", channel)
         if self.models is not None and channels != self.channels:
-            self.models = None
+            self.models, self.latest = None, {}
             self.locate_label.setText("Diode channels changed: locate the steps again.")
-            self._report("Diode channels changed: step lock cleared.")
+            self._report("Diode channels changed: step lock and earlier scans cleared.")
             self._set_busy(False)
 
     def on_order_changed(self, first):
@@ -411,13 +425,15 @@ class ScanWindow(QMainWindow):
         self._warn_trigger(shot)
         self.locate_label.setText("Locked: " + "; ".join(f"{self.channels[r]} {m.t1:.0f}/{m.t2:.0f} µs"
                                                          for r, m in self.models.items()))
-        if self.points:
-            # Re-measure the scan so far with the new step times, so every point uses the same ones.
-            self.points = [(x, Shot(s.raw, s.traces, self.models,
-                                    {r: measure_steps(s.traces[ch], self.models[r]) for r, ch in self.channels.items()},
-                                    s.trigger_mode))
-                           for x, s in self.points]
-            self._report("  The scan so far was re-measured with the new step times.")
+        scans = {id(self.points): self.points, **{id(e["points"]): e["points"] for e in self.latest.values()}}
+        if any(scans.values()):
+            # Re-measure the scans kept so far with the new step times, so every point uses the same ones.
+            for points in scans.values():
+                points[:] = [(x, Shot(s.raw, s.traces, self.models,
+                                      {r: measure_steps(s.traces[ch], self.models[r]) for r, ch in self.channels.items()},
+                                      s.trigger_mode))
+                             for x, s in points]
+            self._report("  The scans kept so far were re-measured with the new step times.")
         self._plot_trace(shot)
         self._redraw(report=bool(self.points))
         self._set_busy(False, "Steps located and locked. Next: scan a stage axis.")
@@ -432,6 +448,11 @@ class ScanWindow(QMainWindow):
     def on_collected(self, shot):
         x = self._pending_x
         self.points.append((x, shot))
+        stage = self._stage()
+        self.collected[stage] += 1
+        other = next(st for st in STAGES if st != stage)
+        self.latest[(stage, self._axis())] = {"scan": self.scan, "unit": self._unit(), "points": self.points,
+                                              "other": self.collected[other]}
         self.last_shot = shot
         k = len(self.points)
         file = self.session.save_capture(f"scan{self.scan:02d}_p{k:03d}", shot.raw)
@@ -505,7 +526,7 @@ class ScanWindow(QMainWindow):
         points = self._scan_points()
         x = np.array([p.x for p in points])
         try:
-            result = analyze(points, list(DIODES), target)
+            result = analyze(points, list(DIODES), target, self._pairing()[self._axis()])
         except ValueError as e:
             result = None
             self.result_label.setText(str(e))
@@ -543,18 +564,24 @@ class ScanWindow(QMainWindow):
         unit, last = self._unit(), self.points[-1][0]
         stage, axis, target = self._stage_name(), self._axis(), result.target
         if result.role is None:
-            text = "No zero crossing yet."
+            text = "No zero crossing on this axis's diode yet."
         else:
             best = result.fits[target][result.role]
             text = (f"Move the {stage} {axis} to {self._x(result.x0)} ± {result.x0_err:.2g}\n"
                     f"({result.x0 - last:+.4g} {unit} from the last point at {self._x(last)})\n"
-                    f"Centers {target} along {axis}. From {result.role} ({self.channels[result.role]}): "
+                    f"Centers {target} along {axis}, using {result.role} ({self.channels[result.role]}), "
                     f"slope {best.slope:+.4g} mV/{unit}.")
-            text += self._other_magnet_text(result)
+        text += "\n" + self._zeros_text(result, target)
+        text += self._other_magnet_text(result)
         notes = list(result.notes)
         if self._stage() == "mount" and self._mount_moves_pmq2(result):
             notes.append("PMQ2's kick changes more than PMQ1's on this mount scan, but the mount only moves PMQ1: "
                          "the arrival order looks swapped. Change 'First step to arrive'.")
+        elif self._stage() == "mount":
+            notes += self._leak_notes(result)
+        centers, why = self._centers(self._stage())
+        text += "\n\n" + (self._centers_text(centers) if centers else why)
+        notes += self._pairing_notes(centers)
         if notes:
             text += "\n\n" + "\n".join(f"! {note}" for note in notes)
         self.result_label.setText(text)
@@ -564,19 +591,117 @@ class ScanWindow(QMainWindow):
         self.session.log({"kind": "analysis", "scan": self.scan, "stage": self._stage(), "axis": axis, "unit": unit,
                           "target": target, "role": result.role, "x0": result.x0, "x0_err": result.x0_err,
                           "fits": result.fits, "notes": notes})
+        if centers:
+            scans = {a: self.latest[(self._stage(), a)]["scan"] for a in AXES}
+            self.session.log({"kind": "center_2d", "stage": self._stage(), "unit": unit, "scans": scans,
+                              "roles": list(DIODES), "centers": {m: c for m, c in centers.items()}})
+
+    def _zeros_text(self, result, magnet):
+        """Where the magnet's kick crosses zero on each diode, marking the one used for this axis."""
+        parts = []
+        for role, f in result.fits[magnet].items():
+            used = " (used)" if role == result.role else ""
+            value = f"{f.x0:+.5g} ± {f.x0_err:.2g}" if f.significant else "no clear slope"
+            parts.append(f"{role} ({self.channels[role]}){used}: {value}")
+        return f"{magnet} zero on each diode: " + "; ".join(parts)
 
     def _other_magnet_text(self, result):
-        """Where the other magnet's kick crosses zero on this scan, when it says something useful."""
+        """Where the other magnet's kick crosses zero on this scan's diode, on a cage scan."""
         other = next(m for m in MAGNETS if m != result.target)
-        usable = {r: f for r, f in result.fits[other].items() if f.significant}
-        if self._stage() != "cage" or not usable:
+        if self._stage() != "cage" or result.role is None:
             return ""
-        role = min(usable, key=lambda r: usable[r].x0_err)
-        f, unit = usable[role], self._unit()
+        f, unit = result.fits[other][result.role], self._unit()
+        if not f.significant:
+            return ""
         gap = f.x0 - result.x0
-        return (f"\n{other}'s kick crosses zero at {self._x(f.x0)} ± {f.x0_err:.2g}. With the cage at "
-                f"{result.target}'s zero, the PMQ1 mount has to move PMQ1 by {gap:+.4g} {unit} along the cage's "
+        return (f"\n{other}'s kick crosses zero at {self._x(f.x0)} ± {f.x0_err:.2g} on {result.role}. With the cage at "
+                f"{result.target}'s zero, the PMQ1 mount has to move PMQ1 by about {gap:+.4g} {unit} along the cage's "
                 f"+{self._axis()} direction.")
+
+    # --- 2x2 center ---------------------------------------------------------
+
+    def _centers(self, stage):
+        """{magnet: Center} from the latest x and y scans of this stage, or (None, why not)."""
+        scans = [self.latest.get((stage, axis)) for axis in AXES]
+        missing = [axis for axis, e in zip(AXES, scans) if e is None or len({x for x, _ in e["points"]}) < 2]
+        if missing:
+            return None, (f"2×2 center: scan the {STAGES[stage][0]} in {' and '.join(missing)} too (2+ positions) "
+                          "to solve for the center directly.")
+        if scans[0]["unit"] != scans[1]["unit"]:
+            return None, f"2×2 center: the x and y scans use different units ({scans[0]['unit']}, {scans[1]['unit']})."
+        magnets = CENTERS_2D[stage]
+        if scans[0]["other"] != scans[1]["other"]:
+            # The other stage was scanned between the x and y scans, so it probably moved. The cage stage's
+            # PMQ2 center does not care (the mount does not move PMQ2); every other center does.
+            magnets = [m for m in magnets if (stage, m) == ("cage", "PMQ2")]
+            if not magnets:
+                return None, ("2×2 center: the cage was scanned between the mount's x and y scans, so PMQ1 may have "
+                              "moved. Rescan one mount axis.")
+        roles = list(DIODES)
+        fits = [fit_all([ScanPoint(x, self._steps(shot)) for x, shot in e["points"]], roles) for e in scans]
+        centers = {}
+        for magnet in magnets:
+            try:
+                centers[magnet] = center_2d(magnet, fits[0][magnet], fits[1][magnet], roles)
+            except np.linalg.LinAlgError:
+                return None, f"2×2 center: {magnet}'s response matrix is singular (no slope on one axis)."
+        return centers, None
+
+    def _pairing(self):
+        """Axis -> diode used for its zero: PAIRING, swapped when this stage's response says it would diverge."""
+        centers, _ = self._centers(self._stage())
+        target = self._target()
+        if centers and target in centers and abs(centers[target].rho) > 1:
+            return {"x": PAIRING["y"], "y": PAIRING["x"]}
+        return dict(PAIRING)
+
+    def _pairing_notes(self, centers):
+        target = self._target()
+        if not centers or target not in centers:
+            return []
+        rho = centers[target].rho
+        pairing = self._pairing()
+        notes = []
+        if rho == 0:
+            return notes
+        if abs(rho) > 1:
+            notes.append(f"Diodes swapped: x uses {pairing['x']} and y uses {pairing['y']}. With this response the usual "
+                         f"pairing would diverge (rho = {rho:+.3g}, so this one has {1 / rho:+.3g}).")
+        if 0.3 < min(abs(rho), 1 / abs(rho)):
+            notes.append(f"x-then-y scans converge slowly here (each round leaves {min(abs(rho), 1 / abs(rho)):.0%} of "
+                         "the error): use the 2×2 center.")
+        return notes
+
+    def _centers_text(self, centers):
+        stage, unit = self._stage(), self._unit()
+        scans = {a: self.latest[(stage, a)]["scan"] for a in AXES}
+        lines = [f"2×2 center ({STAGES[stage][0]}, scans {scans['x']} x and {scans['y']} y):"]
+        for magnet, c in centers.items():
+            lines.append(f"  {magnet}: x {self._x(c.x)} ± {c.x_err:.2g}, y {self._x(c.y)} ± {c.y_err:.2g}")
+        target = STAGES[stage][1]
+        c = centers[target]
+        lines.append(f"  Move the {STAGES[stage][0]} to x {c.x:+.5g}, y {c.y:+.5g} {unit} to center {target}. "
+                     f"Per-round factor of x-then-y scans rho = {min(abs(c.rho), 1 / abs(c.rho)) if c.rho else 0:.3g}.")
+        if stage == "cage" and "PMQ1" in centers:
+            d = np.array([centers["PMQ1"].x - c.x, centers["PMQ1"].y - c.y])
+            lines.append(f"  Then the PMQ1 mount has to move PMQ1 by ({d[0]:+.4g}, {d[1]:+.4g}) {unit} along the cage's x, y.")
+        elif stage == "cage":
+            lines.append("  (No PMQ1 center: the mount was scanned between these x and y scans, so PMQ1 may have moved.)")
+        J = c.J
+        lines.append(f"  Response {target} (mV/{unit}; rows {', '.join(DIODES)}; cols x, y): "
+                     f"[{J[0, 0]:+.4g} {J[0, 1]:+.4g}; {J[1, 0]:+.4g} {J[1, 1]:+.4g}], cond {c.cond:.1f}")
+        return "\n".join(lines)
+
+    def _leak_notes(self, result):
+        """The mount cannot move PMQ2, so a PMQ2 slope on a mount scan is PMQ1's step leaking into PMQ2's fit."""
+        leaks = {r: abs(result.fits["PMQ2"][r].slope / result.fits["PMQ1"][r].slope) for r in DIODES
+                 if result.fits["PMQ1"][r].significant and result.fits["PMQ2"][r].significant}
+        if not leaks or max(leaks.values()) < LEAK_WARN:
+            return []
+        role = max(leaks, key=leaks.get)
+        return [f"PMQ2's kick moves with the mount by {leaks[role]:.0%} of PMQ1's on {role}. The mount cannot move PMQ2, "
+                "so the step-time lock is letting PMQ1's step leak into PMQ2's: every zero is shifted by it. Locate "
+                "again with the wire far off-center on both magnets (both steps large on both diodes)."]
 
     @staticmethod
     def _mount_moves_pmq2(result):
